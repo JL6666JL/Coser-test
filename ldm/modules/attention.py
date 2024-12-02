@@ -351,24 +351,66 @@ class BasicTransformerBlockV2(nn.Module):
         self.checkpoint = checkpoint
 
     # 在ControlNet中也用到了这个，但是在ControlNet中不需要使用seg的相关信息，使用if做区分
+    def forward(self, x, context=None):
+        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+
+    def _forward(self, x, context=None):
+        # [4, 4096, 320]
+        x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x  # [4, 4096, 320]
+        x = self.attn2(self.norm2(x), context=context) + x
+        x = self.ff(self.norm3(x)) + x
+        return x
+
+class BasicTransformerBlockV2_seg(nn.Module):
+    ATTENTION_MODES = {
+        "softmax": CrossAttention,  # vanilla attention
+        "softmax-xformers": MemoryEfficientCrossAttention
+    }
+    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True,
+                 disable_self_attn=False):
+        super().__init__()
+        # softmax-xformers , XFORMERS_IS_AVAILBLE=True
+        attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILBLE else "softmax"
+        assert attn_mode in self.ATTENTION_MODES
+        attn_cls = self.ATTENTION_MODES[attn_mode]
+        self.disable_self_attn = disable_self_attn  # False
+
+        self.attn1 = attn_cls(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout,
+                              context_dim=context_dim if self.disable_self_attn else None)  # is a self-attention if not self.disable_self_attn
+        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+        self.attn2 = attn_cls(query_dim=dim, context_dim=context_dim,
+                              heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
+
+        # 这两个参数应该通过形参传入，因为代码还不确定，就先写死。其实context_dim也是1024
+        seg_prompt_dim = 1024 
+        seg_img_dim = 1024 
+        self.attn3 = attn_cls(query_dim=dim, context_dim=seg_prompt_dim,
+                              heads=n_heads, dim_head=d_head, dropout=dropout)
+        self.attn4 = attn_cls(query_dim=dim, context_dim=seg_prompt_dim,
+                              heads=n_heads, dim_head=d_head, dropout=dropout)
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+        self.norm4 = nn.LayerNorm(dim)
+        self.norm5 = nn.LayerNorm(dim)
+        self.checkpoint = checkpoint
+
+    # 在ControlNet中也用到了这个，但是在ControlNet中不需要使用seg的相关信息，使用if做区分
     def forward(self, x, context=None, seg_prompt_emb=None, seg_img_emb=None):
-        if seg_prompt_emb == None or seg_img_emb == None:
-            return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
-        else:
             return checkpoint(self._forward, (x, context, seg_prompt_emb, seg_img_emb), self.parameters(), self.checkpoint)
 
     def _forward(self, x, context=None, seg_prompt_emb=None, seg_img_emb=None):
         if seg_prompt_emb!=None and seg_img_emb!=None:
             B,T,N,C = seg_prompt_emb.shape
             seg_prompt_emb = seg_prompt_emb.view(B,T*N,C).contiguous()
-            print(C)
             B,T,N,C = seg_img_emb.shape
             seg_img_emb = seg_img_emb.view(B,T*N,C).contiguous()
-            print(C)
-            input('debug')
         # [4, 4096, 320]
         x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x  # [4, 4096, 320]
         x = self.attn2(self.norm2(x), context=context) + x
+        x = self.attn3(self.norm4(x), context=seg_prompt_emb) + x
+        x = self.attn4(self.norm5(x), context=seg_img_emb) + x
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -398,6 +440,14 @@ class BasicTransformerBlockV8_refV5(nn.Module):
         self.attn4_ref_lna = CrossAttention_hard(query_dim=dim, context_dim=None,
                                             heads=n_heads, dim_head=d_head, dropout=dropout) # is self-attn if context is none
         
+        # 这两个参数应该通过形参传入，因为代码还不确定，就先写死。其实context_dim也是1024
+        seg_prompt_dim = 1024 
+        seg_img_dim = 1024 
+        self.attn5 = attn_cls(query_dim=dim, context_dim=seg_prompt_dim,
+                              heads=n_heads, dim_head=d_head, dropout=dropout)
+        self.attn6 = attn_cls(query_dim=dim, context_dim=seg_prompt_dim,
+                              heads=n_heads, dim_head=d_head, dropout=dropout)
+        
         self.zero_conv_lna = zero_module(nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0))
         self.zero_conv_r_lna = zero_module(nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0))
         
@@ -406,13 +456,18 @@ class BasicTransformerBlockV8_refV5(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.norm4_lna = nn.LayerNorm(dim)
         self.norm5_lna = nn.LayerNorm(dim)
-        
+        self.norm6 = nn.LayerNorm(dim)
+        self.norm7 = nn.LayerNorm(dim)
+
         self.checkpoint = checkpoint
 
-    def forward(self, x, context=None, lr=None, ref=None, h=None, w=None, gen_mode=False):
-        return checkpoint(self._forward, (x, context, lr, ref, h, w, gen_mode), self.parameters(), self.checkpoint)
+    def forward(self, x, context=None, lr=None, ref=None, h=None, w=None, gen_mode=False, seg_prompt_emb=None, seg_img_emb=None):
+        return checkpoint(self._forward, (x, context, lr, ref, h, w, gen_mode, seg_prompt_emb, seg_img_emb), self.parameters(), self.checkpoint)
 
-    def _forward(self, x, context=None, lr=None, ref=None, h=None, w=None, gen_mode=False):
+    def _forward(self, x, context=None, lr=None, ref=None, h=None, w=None, gen_mode=False, seg_prompt_emb=None, seg_img_emb=None):
+        if seg_prompt_emb!=None and seg_img_emb!=None:
+            seg_prompt_emb = rearrange(seg_prompt_emb, 'b h w c -> b (h w) c ').contiguous()
+            seg_img_emb = rearrange(seg_img_emb, 'b h w c -> b (h w) c ').contiguous()
         if not gen_mode:
             cond = self.attn4_ref_lna(lr, ref)
             cond = rearrange(cond, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
@@ -424,9 +479,10 @@ class BasicTransformerBlockV8_refV5(nn.Module):
             x = x + cond
         x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None) + x
         x = self.attn2(self.norm2(x), context=context) + x
+        x = self.attn5(self.norm6(x), context=seg_prompt_emb) + x
+        x = self.attn6(self.norm7(x), context=seg_img_emb) + x
         x = self.ff(self.norm3(x)) + x
         return x
-
 
 class SpatialTransformer(nn.Module):
     """
@@ -581,6 +637,79 @@ class SpatialTransformerV2d4(nn.Module):
         self.use_linear = use_linear
     
     # context是caption的编码，lr_prompt是cognitive embedding
+    def forward(self, x, context=None, lr_prompt=None):
+        # note: if no context is given, cross-attention defaults to self-attention
+        # if not isinstance(context, list):
+        #     context = [context]
+        b, c, h, w = x.shape
+        x_in = x
+        x = self.norm(x)
+        if not self.use_linear:
+            x = self.proj_in(x)
+        x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
+        if self.use_linear:
+            x = self.proj_in(x)
+        # x.shape [4, 4096, 320]
+        # if条件成立，把caption和cognitive embedding拼接
+        if context is not None:
+            context = torch.cat([context, lr_prompt], 1)    # [4, 127, 1024]
+        else:
+            context = lr_prompt
+        # self.transformer_blocks的长度是1
+        for i, block in enumerate(self.transformer_blocks):
+            # [4, 4096, 320]
+            x = block(x, context=context)
+        if self.use_linear:
+            x = self.proj_out(x)
+        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
+        if not self.use_linear:
+            x = self.proj_out(x)
+        return x + x_in
+
+class SpatialTransformerV2d4_seg(nn.Module):
+    """
+    Transformer block for image-like data.
+    First, project the input (aka embedding)
+    and reshape to b, t, d.
+    Then apply standard transformer action.
+    Finally, reshape to image
+    NEW: use_linear for more efficiency instead of the 1x1 convs
+    """
+    def __init__(self, in_channels, n_heads, d_head,
+                 depth=1, dropout=0., context_dim=None,
+                 disable_self_attn=False, use_linear=False,
+                 use_checkpoint=False):
+        super().__init__()
+        if exists(context_dim) and not isinstance(context_dim, list):
+            context_dim = [context_dim]
+        self.in_channels = in_channels
+        inner_dim = n_heads * d_head
+        self.norm = Normalize(in_channels)
+        if not use_linear:
+            self.proj_in = nn.Conv2d(in_channels,
+                                     inner_dim,
+                                     kernel_size=1,
+                                     stride=1,
+                                     padding=0)
+        else:
+            self.proj_in = nn.Linear(in_channels, inner_dim)
+
+        self.transformer_blocks = nn.ModuleList(
+            [BasicTransformerBlockV2_seg(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim[d],
+                                   disable_self_attn=disable_self_attn, checkpoint=use_checkpoint)
+                for d in range(depth)]
+        )
+        if not use_linear:
+            self.proj_out = zero_module(nn.Conv2d(inner_dim,
+                                                  in_channels,
+                                                  kernel_size=1,
+                                                  stride=1,
+                                                  padding=0))
+        else:
+            self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
+        self.use_linear = use_linear
+    
+    # context是caption的编码，lr_prompt是cognitive embedding
     def forward(self, x, context=None, lr_prompt=None, seg_prompt_emb=None, seg_img_emb=None ):
         # note: if no context is given, cross-attention defaults to self-attention
         # if not isinstance(context, list):
@@ -609,7 +738,6 @@ class SpatialTransformerV2d4(nn.Module):
         if not self.use_linear:
             x = self.proj_out(x)
         return x + x_in
-
 
 class SpatialTransformerV8_refV5(nn.Module):
     """
@@ -691,7 +819,8 @@ class SpatialTransformerV8_refV5(nn.Module):
         
         self.use_linear = use_linear
 
-    def forward(self, x, context=None, lr=None, lr_prompt=None, ref=None, gen_mode=False):
+    # 四个参数分别是，caption embedding，lr的ControlNet编码，coginitive embedding，reference的ControlNet编码
+    def forward(self, x, context=None, lr=None, lr_prompt=None, ref=None, gen_mode=False, seg_prompt_emb=None, seg_img_emb=None):
         # note: if no context is given, cross-attention defaults to self-attention
         # if not isinstance(context, list):
         #     context = [context]
@@ -707,6 +836,7 @@ class SpatialTransformerV8_refV5(nn.Module):
         if self.use_linear:
             x = self.proj_in(x)
 
+        # gen_mode=False，if条件成立
         if not gen_mode:
             if lr is not None and self.use_lr:
                 if self.dubch:
@@ -741,7 +871,7 @@ class SpatialTransformerV8_refV5(nn.Module):
                 context = lr_prompt
 
             for i, block in enumerate(self.transformer_blocks):
-                x = block(x, context=context, lr=x_c, ref=ref_c, h=h, w=w)
+                x = block(x, context=context, lr=x_c, ref=ref_c, h=h, w=w, seg_prompt_emb=seg_prompt_emb, seg_img_emb=seg_img_emb)
         else:
             x_c = None
             ref_c = None
@@ -751,8 +881,7 @@ class SpatialTransformerV8_refV5(nn.Module):
                 context = lr_prompt
 
             for i, block in enumerate(self.transformer_blocks):
-                x = block(x, context=context, lr=x_c, ref=ref_c, h=h, w=w, gen_mode=gen_mode)
-
+                x = block(x, context=context, lr=x_c, ref=ref_c, h=h, w=w, gen_mode=gen_mode, seg_prompt_emb=seg_prompt_emb, seg_img_emb=seg_img_emb)
         if self.use_linear:
             x = self.proj_out(x)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()

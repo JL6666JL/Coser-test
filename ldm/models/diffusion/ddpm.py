@@ -1413,7 +1413,6 @@ class LatentDiffusion(DDPM):
 
         return samples, intermediates
 
-
     @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
                    quantize_denoised=True, inpaint=False, plot_denoise_rows=False, plot_progressive_rows=True,
@@ -2311,8 +2310,23 @@ class LatentDiffusionCogSR(DDPM):
         if self.use_usm:
             im_ref = usm_sharpener(im_ref)
         im_ref = im_ref.to(memory_format=torch.contiguous_format).float()
+
+        im_segs = batch['segs']
+        if self.use_usm:
+            im_segs = im_segs.permute(1,0,2,3,4)
+            for i in range(im_segs.shape[0]):
+                im_segs[i] = usm_sharpener(im_segs[i])
+            im_segs = im_segs.permute(1,0,2,3,4)
+        im_segs = im_segs.to(memory_format=torch.contiguous_format).float()
+        im_masks = batch['masks']
+        im_masks = im_masks.to(memory_format=torch.contiguous_format).float()
+        segs_num = batch['segs_num']
         
         self.lq_clip_val = im_lq.detach().clone().contiguous()
+
+        self.segs = im_segs.detach().clone().contiguous()    #使用成员变量传递参数，而不是在get_input()的返回值中传递
+        self.masks = im_masks.detach().clone().contiguous()    
+        self.segs_num = segs_num
 
         if resize_lq:
             im_lq = F.interpolate(
@@ -2366,6 +2380,7 @@ class LatentDiffusionCogSR(DDPM):
         #     text_cond = text_cond[:z.size(0)]
         # assert len(text_cond) == z.size(0)
         text_cond = batch["caption"]
+        self.seg_c = batch['seg_captions']
 
         out = [z, text_cond, z_gt, z_ref]
 
@@ -2544,7 +2559,7 @@ class LatentDiffusionCogSR(DDPM):
         return loss
 
     # x,gt,ref都是从对角高斯分布中采样后的后验分布了，c还是文本形式的caption
-    def forward(self, x, c, gt, ref, segs=None,masks=None,seg_captions=None,*args, **kwargs):
+    def forward(self, x, c, gt, ref,*args, **kwargs):
         index = np.random.randint(0, self.num_timesteps, size=x.size(0))
         t = torch.from_numpy(index)
         t = t.to(self.device).long()
@@ -2562,7 +2577,7 @@ class LatentDiffusionCogSR(DDPM):
                 print(s)
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        
+
         seg_c = []
         for now_c in self.seg_c:
             if self.model.conditioning_key is not None:
@@ -2577,7 +2592,7 @@ class LatentDiffusionCogSR(DDPM):
                     now_c = self.q_sample(x_start=now_c, t=tc, noise=torch.randn_like(now_c.float()))
             seg_c.append(now_c)
         seg_c = torch.stack(seg_c)  # [30, 4, 77, 1024]
-        seg_c.permute(1,0,2,3)  # [4, 30, 77, 1024]
+        seg_c = seg_c.permute(1,0,2,3).contiguous()
 
         # clip image embedding
         image_c = self.pre_sr_model(self.lq_clip)   # 先用垃圾一点的预训练超分模型超分一下，self.lq_clip是LR image
@@ -2628,11 +2643,32 @@ class LatentDiffusionCogSR(DDPM):
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
 
+        seg_c = []
+        for now_c in self.seg_c:
+            if self.model.conditioning_key is not None:
+                assert now_c is not None
+                if self.cond_stage_trainable:
+                    now_c = self.get_learned_conditioning(now_c)
+                else:
+                    now_c, tokens = self.cond_stage_model(now_c)    # [4, 77, 1024] 在原始配置中只跑这一句，把caption经过clip进行编码
+                if self.shorten_cond_schedule:  # TODO: drop this option
+                    print(s)
+                    tc = self.cond_ids[t].to(self.device)
+                    now_c = self.q_sample(x_start=now_c, t=tc, noise=torch.randn_like(now_c.float()))
+            seg_c.append(now_c)
+        seg_c = torch.stack(seg_c)  # [30, 4, 77, 1024]
+        seg_c = seg_c.permute(1,0,2,3).contiguous()
+
         # clip image embedding
         image_c = self.pre_sr_model(self.lq_clip_val)
         gt_resize = F.interpolate((self.gt_val+1.0)/2, size=(image_c.size(-2), image_c.size(-1)), mode='bicubic')
         pre_sr_loss = (gt_resize - image_c).abs().mean()
         image_features = self.cond_stage_model.encode_with_vision_transformer(self.clip_transfrom(image_c))
+        
+        seg_features = []
+        for i in range(self.segs.shape[0]):
+            seg_features.append(self.cond_stage_model.encode_with_vision_transformer(self.clip_transfrom(self.segs[i])))
+        seg_features = torch.stack(seg_features)    #[4, 30, 257, 1024]
 
         # cognitive embedding
         if self.global_adapter_optimize:
@@ -2645,7 +2681,7 @@ class LatentDiffusionCogSR(DDPM):
             text = ['' for _ in range(x.size(0))]
             c, _ = self.cond_stage_model(text)
 
-        condition_dic = {'prompt_emb': c, 'lr_prompt_emb': cog_emb, 'reference': ref}
+        condition_dic = {'prompt_emb': c, 'lr_prompt_emb': cog_emb, 'reference': ref, 'seg_prompt_emb': seg_c, 'seg_img_emb': seg_features}
 
         return self.p_losses(gt, condition_dic, t, t_ori, x, pre_sr_loss, clip_adapt_loss, *args, **kwargs)
 

@@ -195,8 +195,11 @@ data:
       params:
         dataroot_gt: /data1/jianglei/coser_imagenet_10
         dataroot_lq: /data1/jianglei/coser_imagenet_10
+        seg_path: /data1/jianglei/coser_imagenet_10_seg
+        mask_path: /data1/jianglei/coser_imagenet_10_mask
         meta_info: data/ImageNet_10/Obj512_all/val.txt
         caption_path: data/ImageNet_10/Obj512_all/blip2_imagenet_captions_all.json
+        seg_caption_path: data/ImageNet_10/Obj512_all/seg_blip2_imagenet_captions_all.json
         reference_path: data/ImageNet_10/Obj512_all/imagenet_all_clipcls.pkl
         reference_select_num: 10
         drop_rate: 0

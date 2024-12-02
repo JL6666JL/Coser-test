@@ -13,6 +13,7 @@ import random
 import numpy as np
 import warnings
 import pickle
+import torch
 
 
 @DATASET_REGISTRY.register()
@@ -165,10 +166,22 @@ class PairedImageCapRefDataset(data.Dataset):
             self.filename_tmpl = '{}'
 
         self.paths = []
+        self.seg_paths = []
+        self.mask_paths = []
         if 'meta_info' in opt:
             with open(self.opt['meta_info']) as fin:
                 for line in fin.readlines():
-                    self.paths.append(line.rstrip('\n'))
+                    names = line.rstrip('\n').split('/')
+                    self.paths.append(names[0])
+                    now_segs = []
+                    now_masks = []
+                    for i in range(1,len(names)):
+                        now_segs.append(os.path.join(opt['seg_path'], names[i]))
+                        last_underscore_index = names[i].rfind('_')
+                        mask_name = names[i][:last_underscore_index]+"_mask"+names[i][last_underscore_index:]
+                        now_masks.append(os.path.join(opt['mask_path'], mask_name))
+                    self.seg_paths.append(now_segs)
+                    self.mask_paths.append(now_masks)
         else:
             self.paths = os.listdir(opt['dataroot_lq'])
 
@@ -191,6 +204,11 @@ class PairedImageCapRefDataset(data.Dataset):
             self.only_class = True
         else:
             self.use_caption = False
+        
+        if 'seg_caption_path' in opt:
+            df = pd.read_json(opt['seg_caption_path'])
+            df.set_index(["filename"], inplace=True)
+            self.seg_caption_df = df
 
         # reference
         with open(opt['reference_path'], 'rb') as f:
@@ -200,11 +218,17 @@ class PairedImageCapRefDataset(data.Dataset):
         self.drop_rate = opt['drop_rate']
         self.ref_drop_rate = opt['ref_drop_rate'] if 'ref_drop_rate' in opt else 0.0
 
-    def generate_caption(self, image_name, clip_thre=0.28, class_name_score=0.5):
+    # 添加了image_class_name的参数，因为分割后的图片的类别写在文件名中
+    def generate_caption(self, image_name, image_class_name,clip_thre=0.28, class_name_score=0.5):
         caption_list = []
         prob_list = []
-        caption_data = self.caption_df.loc[image_name]
-        class_name = self.class_df.loc[image_name.split('_')[0], 2].replace('_', ' ')
+        if image_class_name == None:
+            caption_data = self.caption_df.loc[image_name]
+            class_name = self.class_df.loc[image_name.split('_')[0], 2].replace('_', ' ')
+        else:
+            caption_data = self.seg_caption_df.loc[image_name]
+            class_name = image_class_name
+
         base_caption = 'a photo of ' + class_name
         caption_list.append(base_caption)
         prob_list.append(class_name_score)
@@ -244,6 +268,8 @@ class PairedImageCapRefDataset(data.Dataset):
             self.file_client = FileClient(self.io_backend_opt.pop('type'), **self.io_backend_opt)
 
         scale = self.opt['scale']
+        seg_paths = self.seg_paths[index]
+        mask_paths = self.mask_paths[index]
 
         # Load gt and lq images. Dimension order: HWC; channel order: BGR;
         # image range: [0, 1], float32.
@@ -259,13 +285,36 @@ class PairedImageCapRefDataset(data.Dataset):
         class_num = image_name.split('_')[0]
         if self.use_caption and (random.random() > self.drop_rate):
             if not self.only_class:
-                caption_list, prob_list = self.generate_caption(image_name)
+                caption_list, prob_list = self.generate_caption(image_name,None)
                 caption = np.random.choice(caption_list, p=prob_list)
             else:
                 class_name = self.class_df.loc[class_num, 2].replace('_', ' ')
                 caption = 'a photo of ' + class_name
         else:
             caption = ""
+        
+        # generate segments caption
+        seg_captions = []
+        for seg_path in seg_paths:
+            seg_image_name = seg_path.split('/')[-1]
+            seg_class_name = seg_image_name.split('_')[2]
+            seg_caption_list, seg_pro_list = self.generate_caption(seg_image_name,seg_class_name)
+            now_seg_caption = np.random.choice(seg_caption_list,p=seg_pro_list)
+            seg_captions.append(now_seg_caption)
+
+        # 读取segments的图片
+        img_seg = []
+        for now_seg_path in seg_paths:
+            now_seg_bytes = self.file_client.get(now_seg_path, 'seg')
+            now_img_seg = imfrombytes(now_seg_bytes, float32=True)
+            img_seg.append(now_img_seg)
+
+        # 读取mask的图片
+        img_mask = []
+        for now_mask_path in mask_paths:
+            now_mask_bytes = self.file_client.get(now_mask_path, 'mask')
+            now_img_mask = imfrombytes(now_mask_bytes, float32=True)
+            img_mask.append(now_img_mask)
 
         if random.random() > self.drop_rate:
             ref_filenames = self.reference_sim[class_num]['filename']
@@ -309,12 +358,43 @@ class PairedImageCapRefDataset(data.Dataset):
 
         # BGR to RGB, HWC to CHW, numpy to tensor
         img_gt, img_lq = img2tensor([img_gt, img_lq], bgr2rgb=True, float32=True)
+
+        for i in range(len(img_seg)):
+            img_seg[i] = img2tensor([img_seg[i]], bgr2rgb=True, float32=True)[0]
+        for i in range(len(img_mask)):
+            img_mask[i] = img2tensor([img_mask[i]], bgr2rgb=True, float32=True)[0]
+
+        # 在原始配置文件中，所有图像的大小都相同，所以就直接用gt_size了
+        img_size = self.opt['gt_size']
+        img_tensor_like = torch.zeros(3,img_size,img_size)
+
+        # 把seg和mask的列表长度统一
+        max_len = 10
+        seg_num = torch.tensor(len(img_seg) if len(img_seg)<max_len else max_len)
+        # 对 img_seg 进行处理
+        img_seg = img_seg[:max_len] + [torch.zeros_like(img_tensor_like)] * (max_len - len(img_seg)) if len(img_seg) < max_len else img_seg[:max_len]
+        img_seg = torch.stack(img_seg)
+
+        # 对 img_mask 进行处理
+        img_mask = img_mask[:max_len] + [torch.zeros_like(img_tensor_like)] * (max_len - len(img_mask)) if len(img_mask) < max_len else img_mask[:max_len]
+        img_mask = torch.stack(img_mask)
+
+        # 对 seg_paths 进行处理
+        seg_paths = seg_paths[:max_len] + [''] * (max_len - len(seg_paths)) if len(seg_paths) < max_len else seg_paths[:max_len]
+
+        # 对 mask_paths 进行处理
+        mask_paths = mask_paths[:max_len] + [''] * (max_len - len(mask_paths)) if len(mask_paths) < max_len else mask_paths[:max_len]
+
+        # 对 seg_captions 进行处理
+        seg_captions = seg_captions[:max_len] + [''] * (max_len - len(seg_captions)) if len(seg_captions) < max_len else seg_captions[:max_len]
+        
         # normalize
         if self.mean is not None or self.std is not None:
             normalize(img_lq, self.mean, self.std, inplace=True)
             normalize(img_gt, self.mean, self.std, inplace=True)
 
-        return {'lq': img_lq, 'gt': img_gt, 'lq_path': lq_path, 'gt_path': gt_path, 'caption': caption, 'ref': img_ref}
+        return {'lq': img_lq, 'gt': img_gt, 'segs': img_seg, 'masks':img_mask, 'segs_num':seg_num,'lq_path': lq_path, 
+                'gt_path': gt_path, 'segs_path': seg_paths, 'masks_path': mask_paths ,'caption': caption, 'seg_captions': seg_captions,'ref': img_ref}
 
     def __len__(self):
         return len(self.paths)

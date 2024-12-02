@@ -31,3 +31,5 @@ with open(train_seg_info, "w") as f:
                     print('no')
                 segs =segs + '/'+ seg_file
             f.write(f"{train_file}{segs}\n")
+        else:
+            f.write(f"{train_file}\n")

@@ -363,6 +363,7 @@ class RealESRGANCapRefDataset(data.Dataset):
             df = pd.read_json(opt['seg_caption_path'])
             df.set_index(["filename"], inplace=True)
             self.seg_caption_df = df
+
         # reference
         with open(opt['reference_path'], 'rb') as f:
             self.reference_sim = pickle.load(f)
@@ -626,16 +627,19 @@ class RealESRGANCapRefDataset(data.Dataset):
         for i in range(len(img_mask)):
             img_mask[i] = img2tensor([img_mask[i]], bgr2rgb=True, float32=True)[0]
 
+        # 在原始配置文件中，所有图像的大小都相同，所以就直接用gt_size了
+        img_size = self.opt['gt_size']
+        img_tensor_like = torch.zeros(3,img_size,img_size)
+
         # 把seg和mask的列表长度统一
-        
         max_len = 10
         seg_num = torch.tensor(len(img_seg) if len(img_seg)<max_len else max_len)
         # 对 img_seg 进行处理
-        img_seg = img_seg[:max_len] + [torch.zeros_like(img_seg[0])] * (max_len - len(img_seg)) if len(img_seg) < max_len else img_seg[:max_len]
+        img_seg = img_seg[:max_len] + [torch.zeros_like(img_tensor_like)] * (max_len - len(img_seg)) if len(img_seg) < max_len else img_seg[:max_len]
         img_seg = torch.stack(img_seg)
 
         # 对 img_mask 进行处理
-        img_mask = img_mask[:max_len] + [torch.zeros_like(img_mask[0])] * (max_len - len(img_mask)) if len(img_mask) < max_len else img_mask[:max_len]
+        img_mask = img_mask[:max_len] + [torch.zeros_like(img_tensor_like)] * (max_len - len(img_mask)) if len(img_mask) < max_len else img_mask[:max_len]
         img_mask = torch.stack(img_mask)
 
         # 对 seg_paths 进行处理

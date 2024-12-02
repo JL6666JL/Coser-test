@@ -25,7 +25,7 @@ from ldm.modules.diffusionmodules.util import (
     normalization,
     timestep_embedding,
 )
-from ldm.modules.attention import SpatialTransformer, SpatialTransformerV2, SpatialTransformerV2d4, SpatialTransformerV8_refV5
+from ldm.modules.attention import SpatialTransformer, SpatialTransformerV2, SpatialTransformerV2d4, SpatialTransformerV8_refV5,SpatialTransformerV2d4_seg
 from ldm.modules.spade import SPADE
 
 from basicsr.archs.stylegan2_arch import ConvLayer, EqualConv2d
@@ -84,7 +84,6 @@ class AttentionPool2d(nn.Module):
         x = self.c_proj(x)
         return x[:, :, 0]
 
-
 class TimestepBlock(nn.Module):
     """
     Any module where forward() takes timestep embeddings as a second argument.
@@ -118,7 +117,6 @@ class TimestepBlock3cond(nn.Module):
         Apply the module to `x` given `emb` timestep embeddings.
         """
 
-
 class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
     A sequential module that passes timestep embeddings to the children that
@@ -135,10 +133,12 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
                 x = layer(x, context)
             elif isinstance(layer, SpatialTransformerV2d4):
                 # assert context is not None
-                x = layer(x, context, lr_prompt, seg_prompt_emb, seg_img_emb)
+                x = layer(x, context, lr_prompt)
+            elif isinstance(layer, SpatialTransformerV2d4_seg):
+                x= layer(x, context, lr_prompt, seg_prompt_emb, seg_img_emb)
             elif isinstance(layer, SpatialTransformerV8_refV5):
                 # assert context is not None
-                x = layer(x, context, lr, lr_prompt, reference, gen_mode)
+                x = layer(x, context, lr, lr_prompt, reference, gen_mode, seg_prompt_emb, seg_img_emb)
             elif isinstance(layer, TimestepBlockDual):
                 assert struct_cond is not None
                 x = layer(x, emb, struct_cond)
@@ -148,7 +148,6 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
             else:
                 x = layer(x)
         return x
-
 
 class Upsample(nn.Module):
     """
@@ -1145,7 +1144,7 @@ class UNetModelAiA(nn.Module):
                                 num_heads=num_heads,
                                 num_head_channels=dim_head,
                                 use_new_attention_order=use_new_attention_order,
-                            ) if not use_spatial_transformer else SpatialTransformerV2d4(
+                            ) if not use_spatial_transformer else SpatialTransformerV2d4_seg(
                                 ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
                                 disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
                                 use_checkpoint=use_checkpoint
@@ -1372,10 +1371,12 @@ class UNetModelAiA(nn.Module):
                 h = module(h, emb, condition['prompt_emb'], lr_prompt=condition['lr_prompt_emb'],
                             seg_prompt_emb=condition['seg_prompt_emb'], seg_img_emb=condition['seg_img_emb'])
                 hs.append(h)
-            h = self.middle_block(h, emb, condition['prompt_emb'], lr_condition_mid, condition['lr_prompt_emb'], reference=ref_condition_mid)
+            h = self.middle_block(h, emb, condition['prompt_emb'], lr_condition_mid, condition['lr_prompt_emb'], reference=ref_condition_mid,
+                            seg_prompt_emb=condition['seg_prompt_emb'], seg_img_emb=condition['seg_img_emb'])
             for module in self.output_blocks:
                 h = th.cat([h, hs.pop()], dim=1)
-                h = module(h, emb, condition['prompt_emb'], lr_condition_dec.pop(), condition['lr_prompt_emb'], reference=ref_condition_dec.pop())
+                h = module(h, emb, condition['prompt_emb'], lr_condition_dec.pop(), condition['lr_prompt_emb'], reference=ref_condition_dec.pop(),
+                            seg_prompt_emb=condition['seg_prompt_emb'], seg_img_emb=condition['seg_img_emb'])
         else:
             h = x.type(self.dtype)
             for module in self.input_blocks:
